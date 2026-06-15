@@ -1,8 +1,11 @@
-use base64::{engine::general_purpose, Engine as _};
-use futures_util::StreamExt; // Brings .next() into scope for HTTP streaming
+mod config; // Imports config.rs module
+
+use base64::{Engine as _, engine::general_purpose};
+use futures_util::StreamExt;
 use image::{ImageBuffer, Rgb};
+use regex::Regex;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
 
@@ -17,7 +20,9 @@ struct CompleteMessage {
 }
 
 /// Generate image using API (Fully Asynchronous & Stream-Safe)
-async fn generate_image(params: &HashMap<String, Value>) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>, Box<dyn std::error::Error>> {
+async fn generate_image(
+    params: &HashMap<String, Value>,
+) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>, Box<dyn std::error::Error>> {
     let server_url = params
         .get("server_url")
         .and_then(|v| v.as_str())
@@ -35,9 +40,8 @@ async fn generate_image(params: &HashMap<String, Value>) -> Result<ImageBuffer<R
         .json(&data)
         .header("Accept", "text/event-stream")
         .send()
-        .await?; 
+        .await?;
 
-    // Convert the response body into an active asynchronous byte stream
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
 
@@ -45,10 +49,9 @@ async fn generate_image(params: &HashMap<String, Value>) -> Result<ImageBuffer<R
         let chunk = chunk_result?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-        // Process any complete lines we have accumulated
         while let Some(line_end) = buffer.find('\n') {
             let line = buffer[..line_end].trim().to_string();
-            buffer.drain(..=line_end); // Safely advance buffer slice
+            buffer.drain(..=line_end);
 
             if line.is_empty() || !line.starts_with("data: ") {
                 continue;
@@ -60,12 +63,13 @@ async fn generate_image(params: &HashMap<String, Value>) -> Result<ImageBuffer<R
                 break;
             }
 
-            // DEFENSIVE PARSING: Catch malformed/cut-off JSON packets if the server crashes
             let msg: Value = match serde_json::from_str(data_str) {
                 Ok(json) => json,
                 Err(_) => {
-                    eprintln!("Warning: Received a fragmented or truncated JSON event string from server.");
-                    continue; // Skip processing this line and keep listening to the remaining bytes
+                    eprintln!(
+                        "Warning: Received a fragmented or truncated JSON event string from server."
+                    );
+                    continue;
                 }
             };
 
@@ -82,14 +86,17 @@ async fn generate_image(params: &HashMap<String, Value>) -> Result<ImageBuffer<R
                 let image_bytes = general_purpose::STANDARD.decode(&complete_msg.image)?;
 
                 if complete_msg.channels != 3 {
-                    return Err("Unsupported channel count. Only 3-channel (RGB) is supported.".into());
+                    return Err(
+                        "Unsupported channel count. Only 3-channel (RGB) is supported.".into(),
+                    );
                 }
 
                 let img_buffer = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(
                     complete_msg.width,
                     complete_msg.height,
                     image_bytes,
-                ).ok_or("Failed to construct image from raw buffer")?;
+                )
+                .ok_or("Failed to construct image from raw buffer")?;
 
                 return Ok(img_buffer);
             }
@@ -101,27 +108,47 @@ async fn generate_image(params: &HashMap<String, Value>) -> Result<ImageBuffer<R
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let negative_prompt = "bad anatomy, bad hands, missing fingers, extra fingers, bad arms, missing legs, missing arms, poorly drawn face, bad face, fused face, cloned face, three crus, fused feet, fused thigh, extra crus, ugly fingers, horn, realistic photo, huge eyes, worst face, 2girl, long fingers, disconnected limbs,";
-
-    let mut params_1 = HashMap::new();
-    params_1.insert("prompt".to_string(), json!("cat playing with ball"));
-    params_1.insert("negative_prompt".to_string(), json!(negative_prompt));
-    params_1.insert("size".to_string(), json!(512));
-    params_1.insert("steps".to_string(), json!(20));
-    params_1.insert("cfg".to_string(), json!(7.0));
-    params_1.insert("use_opencl".to_string(), json!(true));
-
-    let mut params_2 = HashMap::new();
-    params_2.insert("prompt".to_string(), json!("beautiful landscape, mountain"));
-    params_2.insert("negative_prompt".to_string(), json!(negative_prompt));
-    params_2.insert("size".to_string(), json!(512));
-    params_2.insert("steps".to_string(), json!(20));
-    params_2.insert("cfg".to_string(), json!(8.0));
-    params_2.insert("use_opencl".to_string(), json!(true));
-
-    let params_list = vec![params_1, params_2];
-
+    // Ensure the 'outputs' directory exists
     fs::create_dir_all("outputs")?;
+
+    // Determine the next starting sequential file index using regex matching
+    let index_pattern = Regex::new(r"^image_(\d+)\.png$")?;
+    let mut existing_indices = Vec::new();
+
+    if let Ok(entries) = fs::read_dir("outputs") {
+        for entry in entries.flatten() {
+            if let Some(filename_str) = entry.file_name().to_str() {
+                if let Some(caps) = index_pattern.captures(filename_str) {
+                    if let Some(index_match) = caps.get(1) {
+                        if let Ok(idx) = index_match.as_str().parse::<u32>() {
+                            existing_indices.push(idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Next base index is determined safely without overwriting previous work
+    let next_index = existing_indices.into_iter().max().unwrap_or(0) + 1;
+
+    // Pull prompts from the isolated config module
+    let available_prompts = config::get_prompts();
+    let mut params_list = Vec::new();
+
+    for prompt_text in available_prompts {
+        let mut params = HashMap::new();
+        params.insert("prompt".to_string(), json!(prompt_text));
+        params.insert(
+            "negative_prompt".to_string(),
+            json!(config::NEGATIVE_PROMPT),
+        );
+        params.insert("size".to_string(), json!(512));
+        params.insert("steps".to_string(), json!(50));
+        params.insert("cfg".to_string(), json!(7.0));
+        params.insert("use_opencl".to_string(), json!(true));
+        params_list.push(params);
+    }
 
     let total_images = params_list.len();
     for (i, params) in params_list.iter().enumerate() {
@@ -129,7 +156,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match generate_image(params).await {
             Ok(image) => {
-                let output_path = format!("outputs/image_{}.png", i + 1);
+                // Compute output name sequentially to mirror the Python runtime logic precisely
+                let output_path = format!("outputs/image_{}.png", next_index + i as u32);
                 image.save(&output_path)?;
                 println!("Saved: {}", output_path);
             }
