@@ -147,6 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         params.insert("steps".to_string(), json!(50));
         params.insert("cfg".to_string(), json!(7.0));
         params.insert("use_opencl".to_string(), json!(true));
+        params.insert("scheduler".to_string(), json!("dpm_sde"));
         params_list.push(params);
     }
 
