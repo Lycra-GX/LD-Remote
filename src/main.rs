@@ -1,11 +1,10 @@
 use base64::{engine::general_purpose, Engine as _};
+use futures_util::StreamExt; // Brings .next() into scope for HTTP streaming
 use image::{ImageBuffer, Rgb};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
-use std::io::Read;
 
 /// Struct representing the expected JSON structure of a 'complete' message
 #[derive(Deserialize, Debug)]
@@ -17,8 +16,8 @@ struct CompleteMessage {
     channels: u32,
 }
 
-/// Generate image using API
-fn generate_image(params: &HashMap<String, Value>) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>, Box<dyn std::error::Error>> {
+/// Generate image using API (Fully Asynchronous & Stream-Safe)
+async fn generate_image(params: &HashMap<String, Value>) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>, Box<dyn std::error::Error>> {
     let server_url = params
         .get("server_url")
         .and_then(|v| v.as_str())
@@ -30,32 +29,26 @@ fn generate_image(params: &HashMap<String, Value>) -> Result<ImageBuffer<Rgb<u8>
     let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
     println!("Generating: {}", prompt);
 
-    let client = reqwest::blocking::Client::new();
-    // We use a regular text/event-stream request
-    let mut response = client
+    let client = reqwest::Client::new();
+    let response = client
         .post(format!("{}/generate", server_url))
         .json(&data)
         .header("Accept", "text/event-stream")
-        .send()?;
+        .send()
+        .await?; 
 
-    // Dynamic buffer to hold stream pieces across reads
+    // Convert the response body into an active asynchronous byte stream
+    let mut stream = response.bytes_stream();
     let mut buffer = String::new();
-    let mut chunk = vec![0u8; 1024]; // Read in chunks of 1KB
 
-    loop {
-        // Read raw bytes directly from the reqwest response stream
-        let bytes_read = response.read(&mut chunk)?;
-        if bytes_read == 0 {
-            break; // Connection closed gracefully by server
-        }
-
-        // Append new data to our string buffer
-        buffer.push_str(&String::from_utf8_lossy(&chunk[..bytes_read]));
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
 
         // Process any complete lines we have accumulated
         while let Some(line_end) = buffer.find('\n') {
             let line = buffer[..line_end].trim().to_string();
-            buffer.drain(..=line_end); // Remove processed line from buffer
+            buffer.drain(..=line_end); // Safely advance buffer slice
 
             if line.is_empty() || !line.starts_with("data: ") {
                 continue;
@@ -64,10 +57,18 @@ fn generate_image(params: &HashMap<String, Value>) -> Result<ImageBuffer<Rgb<u8>
             let data_str = &line[6..];
 
             if data_str == "[DONE]" {
-                return Err("Stream finished without explicit completion message".into());
+                break;
             }
 
-            let msg: Value = serde_json::from_str(data_str)?;
+            // DEFENSIVE PARSING: Catch malformed/cut-off JSON packets if the server crashes
+            let msg: Value = match serde_json::from_str(data_str) {
+                Ok(json) => json,
+                Err(_) => {
+                    eprintln!("Warning: Received a fragmented or truncated JSON event string from server.");
+                    continue; // Skip processing this line and keep listening to the remaining bytes
+                }
+            };
+
             let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             if msg_type == "progress" {
@@ -95,20 +96,19 @@ fn generate_image(params: &HashMap<String, Value>) -> Result<ImageBuffer<Rgb<u8>
         }
     }
 
-    Err("Stream ended abruptly".into())
+    Err("Stream ended without receiving complete image payload".into())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let negative_prompt = "bad anatomy, bad hands, missing fingers, extra fingers, bad arms, missing legs, missing arms, poorly drawn face, bad face, fused face, cloned face, three crus, fused feet, fused thigh, extra crus, ugly fingers, horn, realistic photo, huge eyes, worst face, 2girl, long fingers, disconnected limbs,";
 
-    // Setup parameter sets matching your Python script structure
     let mut params_1 = HashMap::new();
     params_1.insert("prompt".to_string(), json!("cat playing with ball"));
     params_1.insert("negative_prompt".to_string(), json!(negative_prompt));
-    params_1.insert("size".to_string(), json!(256));
+    params_1.insert("size".to_string(), json!(512));
     params_1.insert("steps".to_string(), json!(20));
-    params_1.insert("cfg".to_string(), json!(8.0));
-    params_1.insert("seed".to_string(), json!(42));
+    params_1.insert("cfg".to_string(), json!(7.0));
     params_1.insert("use_opencl".to_string(), json!(true));
 
     let mut params_2 = HashMap::new();
@@ -117,25 +117,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     params_2.insert("size".to_string(), json!(512));
     params_2.insert("steps".to_string(), json!(20));
     params_2.insert("cfg".to_string(), json!(8.0));
-    params_2.insert("seed".to_string(), json!(42));
     params_2.insert("use_opencl".to_string(), json!(true));
 
     let params_list = vec![params_1, params_2];
 
-    // Ensure the 'outputs' directory exists
     fs::create_dir_all("outputs")?;
 
     let total_images = params_list.len();
     for (i, params) in params_list.iter().enumerate() {
         println!("\nGenerating image {}/{}", i + 1, total_images);
 
-        match generate_image(params) {
+        match generate_image(params).await {
             Ok(image) => {
                 let output_path = format!("outputs/image_{}.png", i + 1);
                 image.save(&output_path)?;
                 println!("Saved: {}", output_path);
             }
-            Err(e) => eprintln!("Error generating image {}: {}", i + 1, e),
+            Err(e) => {
+                eprintln!("Error generating image {}: {}", i + 1, e);
+            }
         }
 
         println!("{}", "-".repeat(50));
