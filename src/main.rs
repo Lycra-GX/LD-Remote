@@ -5,7 +5,6 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::io::Read;
 
 /// Struct representing the expected JSON structure of a 'complete' message
 #[derive(Deserialize, Debug)]
@@ -24,78 +23,70 @@ fn generate_image(params: &HashMap<String, Value>) -> Result<ImageBuffer<Rgb<u8>
         .and_then(|v| v.as_str())
         .unwrap_or("http://localhost:8081");
 
+    // Copy parameters and remove server_url from the payload
     let mut data = params.clone();
     data.remove("server_url");
 
     let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
     println!("Generating: {}", prompt);
 
+    // Set up a synchronous POST request with standard SSE headers
     let client = reqwest::blocking::Client::new();
-    // We use a regular text/event-stream request
-    let mut response = client
+    let response = client
         .post(format!("{}/generate", server_url))
         .json(&data)
         .header("Accept", "text/event-stream")
         .send()?;
 
-    // Dynamic buffer to hold stream pieces across reads
-    let mut buffer = String::new();
-    let mut chunk = vec![0u8; 1024]; // Read in chunks of 1KB
+    // Read the server response stream line by line
+    let reader = BufReader::new(response);
 
-    loop {
-        // Read raw bytes directly from the reqwest response stream
-        let bytes_read = response.read(&mut chunk)?;
-        if bytes_read == 0 {
-            break; // Connection closed gracefully by server
+    for line in reader.lines() {
+        let line = line?;
+        if line.is_empty() || !line.starts_with("data: ") {
+            continue;
         }
 
-        // Append new data to our string buffer
-        buffer.push_str(&String::from_utf8_lossy(&chunk[..bytes_read]));
+        // Strip the "data: " prefix
+        let data_str = &line[6..];
 
-        // Process any complete lines we have accumulated
-        while let Some(line_end) = buffer.find('\n') {
-            let line = buffer[..line_end].trim().to_string();
-            buffer.drain(..=line_end); // Remove processed line from buffer
+        if data_str == "[DONE]" {
+            break;
+        }
 
-            if line.is_empty() || !line.starts_with("data: ") {
-                continue;
+        // Parse JSON event payload
+        let msg: Value = serde_json::from_str(data_str)?;
+        let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if msg_type == "progress" {
+            let step = msg.get("step").and_then(|v| v.as_u64()).unwrap_or(0);
+            let total_steps = msg.get("total_steps").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("Progress: {}/{}", step, total_steps);
+        } else if msg_type == "complete" {
+            // Strongly type the structural fields we need
+            let complete_msg: CompleteMessage = serde_json::from_value(msg)?;
+            println!("Complete: {}ms", complete_msg.generation_time_ms);
+
+            // Decode the Base64 image data
+            let image_bytes = general_purpose::STANDARD.decode(&complete_msg.image)?;
+
+            // Python handles 3D arrays automatically via NumPy. In Rust, we construct 
+            // a container explicitly. Assumes 3 channels (RGB).
+            if complete_msg.channels != 3 {
+                return Err("Unsupported channel count. Only 3-channel (RGB) is supported.".into());
             }
 
-            let data_str = &line[6..];
+            let img_buffer = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(
+                complete_msg.width,
+                complete_msg.height,
+                image_bytes,
+            ).ok_or("Failed to construct image from raw buffer")?;
 
-            if data_str == "[DONE]" {
-                return Err("Stream finished without explicit completion message".into());
-            }
-
-            let msg: Value = serde_json::from_str(data_str)?;
-            let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-            if msg_type == "progress" {
-                let step = msg.get("step").and_then(|v| v.as_u64()).unwrap_or(0);
-                let total_steps = msg.get("total_steps").and_then(|v| v.as_u64()).unwrap_or(0);
-                println!("Progress: {}/{}", step, total_steps);
-            } else if msg_type == "complete" {
-                let complete_msg: CompleteMessage = serde_json::from_value(msg)?;
-                println!("Complete: {}ms", complete_msg.generation_time_ms);
-
-                let image_bytes = general_purpose::STANDARD.decode(&complete_msg.image)?;
-
-                if complete_msg.channels != 3 {
-                    return Err("Unsupported channel count. Only 3-channel (RGB) is supported.".into());
-                }
-
-                let img_buffer = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(
-                    complete_msg.width,
-                    complete_msg.height,
-                    image_bytes,
-                ).ok_or("Failed to construct image from raw buffer")?;
-
-                return Ok(img_buffer);
-            }
+            return Ok(img_buffer);
         }
     }
 
-    Err("Stream ended abruptly".into())
+    Err("Stream ended without receiving a complete image".into())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
