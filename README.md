@@ -4,7 +4,9 @@ A fast, asynchronous Rust command-line tool designed to interface with the `loca
 
 ## Features
 
-- **Runtime Configuration:** Prompts, negative prompts, dimensions, steps, schedulers, and upscaler configurations are fully loaded at runtime from a `config.toml` file—no recompilation needed to tweak settings or add prompts.
+- ~~**Runtime Configuration:** Prompts, negative prompts, dimensions, steps, schedulers, and upscaler configurations are fully loaded at runtime from a `config.toml` file—no recompilation needed to tweak settings or add prompts.~~
+
+   **not ready yet because I had issues when try to use toml as config file, but for some reason the script I run get an error "Error generating image: Stream ended without final success/failed event" , so I need temporary use config.rs and the cons is everytime you update new changes on config.rs it will need to compile the script again which is it will take longer to compile (not that longer only in 15-35 sec).** 
 - **Asynchronous Event-Stream Streaming:** Uses fully asynchronous processing (`tokio` and `reqwest`) to monitor text/event-stream chunks safely until generation completes.
 - **Auto Image Conversion:** Converts incoming raw format pixel byte streams into standard high-quality PNG buffers.
 - **Automated Upscaling Pipeline:** Automatically chains generation into an upscaling workflow via multi-part form data uploads using target hardware upscaler configurations.
